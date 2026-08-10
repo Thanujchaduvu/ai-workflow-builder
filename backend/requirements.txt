@@ -5,3 +5,4 @@ groq
 openai
 python-dotenv
 pydantic
+openai-whisper
