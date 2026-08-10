@@ -1,7 +1,6 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
-import whisper
 import shutil
 import os
 import requests
@@ -26,17 +25,12 @@ app.add_middleware(
 )
 
 # -----------------------------
-# 🎤 Whisper
-# -----------------------------
-model = whisper.load_model("base")
-
-# -----------------------------
-# ⚡ Groq
+# ⚡ GROQ
 # -----------------------------
 groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 # -----------------------------
-# 🗄️ Hasura
+# 🗄️ Hasura (optional)
 # -----------------------------
 HASURA_URL = "http://localhost:8080/v1/graphql"
 MEETING_ID = "5777021f-15f4-4411-adfb-9d1463c317f2"
@@ -47,7 +41,7 @@ MEETING_ID = "5777021f-15f4-4411-adfb-9d1463c317f2"
 last_transcript = ""
 
 # -----------------------------
-# 🧠 PROMPT (FINAL)
+# 🧠 PROMPT
 # -----------------------------
 PROMPT = """
 You are an AI meeting assistant.
@@ -55,9 +49,11 @@ You are an AI meeting assistant.
 Return STRICTLY in this format:
 
 Summary:
+
 - one clear concise summary
 
 Action Items:
+
 - only factual next steps mentioned or implied
 - do NOT assume decisions
 - do NOT add opinions
@@ -79,9 +75,19 @@ def parse_output(output):
             actions = [a.strip("- ").strip() for a in actions if a.strip()]
 
         return summary, actions
-
     except:
         return output, []
+
+# -----------------------------
+# 🎤 GROQ TRANSCRIPTION
+# -----------------------------
+def transcribe_audio(file_path):
+    with open(file_path, "rb") as f:
+        transcription = groq_client.audio.transcriptions.create(
+            file=f,
+            model="whisper-large-v3"
+        )
+    return transcription.text
 
 # -----------------------------
 # ⚡ GROQ SUMMARY
@@ -98,21 +104,6 @@ def summarize_with_groq(text):
     return response.choices[0].message.content
 
 # -----------------------------
-# 🧠 OLLAMA FALLBACK
-# -----------------------------
-def summarize_with_ollama(text):
-    response = requests.post(
-        "http://localhost:11434/api/generate",
-        json={
-            "model": "llama3",
-            "prompt": f"{PROMPT}\n\n{text}",
-            "stream": False
-        },
-        timeout=10
-    )
-    return response.json()["response"]
-
-# -----------------------------
 # 🎤 UPLOAD API
 # -----------------------------
 @app.post("/upload-audio/")
@@ -122,73 +113,29 @@ async def upload_audio(file: UploadFile = File(...)):
     try:
         file_location = f"temp_{file.filename}"
 
-        # Save file
         with open(file_location, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
         print("✅ File saved")
 
-        # Whisper transcription
-        result = model.transcribe(file_location)
-        text = result["text"]
+        # 🔥 GROQ transcription
+        text = transcribe_audio(file_location)
         last_transcript = text
 
-        # Remove file safely
         if os.path.exists(file_location):
             os.remove(file_location)
 
         print("📝 Transcript:", text)
 
-        # 🔥 Groq → Ollama fallback
-        try:
-            raw_summary = summarize_with_groq(text)
-            print("⚡ Used Groq")
+        # 🔥 Summary
+        raw_summary = summarize_with_groq(text)
 
-        except Exception as e:
-            print("❌ Groq failed:", e)
-
-            try:
-                raw_summary = summarize_with_ollama(text)
-                print("🧠 Used Ollama")
-
-            except Exception as ollama_error:
-                print("❌ Ollama also failed:", ollama_error)
-                raw_summary = "Summary:\n- AI unavailable\n\nAction Items:\n- Try again later"
-
-        # Parse summary
         summary_text, action_items = parse_output(raw_summary)
-
-        # -----------------------------
-        # 💾 Save to Hasura
-        # -----------------------------
-        query = """
-        mutation ($text: String!, $meeting_id: uuid!) {
-          insert_transcripts_one(object: {
-            meeting_id: $meeting_id,
-            content: $text
-          }) {
-            id
-          }
-        }
-        """
-
-        db_response = requests.post(
-            HASURA_URL,
-            json={
-                "query": query,
-                "variables": {
-                    "text": text,
-                    "meeting_id": MEETING_ID
-                }
-            },
-            timeout=5
-        )
 
         return {
             "transcript": text,
             "summary": summary_text,
-            "action_items": action_items,
-            "db": db_response.json()
+            "action_items": action_items
         }
 
     except Exception as e:
@@ -206,46 +153,22 @@ async def ask_question(question: str):
         return {"answer": "No transcript available. Upload audio first."}
 
     try:
-        # ⚡ Groq
-        try:
-            response = groq_client.chat.completions.create(
-                model="llama-3.1-8b-instant",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "Answer ONLY using the transcript. If not found, say 'Not mentioned in transcript'."
-                    },
-                    {
-                        "role": "user",
-                        "content": f"Transcript:\n{last_transcript}\n\nQuestion: {question}"
-                    }
-                ],
-                temperature=0.2
-            )
+        response = groq_client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Answer ONLY using the transcript. If not found, say 'Not mentioned in transcript'."
+                },
+                {
+                    "role": "user",
+                    "content": f"Transcript:\n{last_transcript}\n\nQuestion: {question}"
+                }
+            ],
+            temperature=0.2
+        )
 
-            answer = response.choices[0].message.content
-            print("⚡ Groq Q&A")
-
-        except Exception as e:
-            print("❌ Groq failed:", e)
-
-            try:
-                response = requests.post(
-                    "http://localhost:11434/api/generate",
-                    json={
-                        "model": "llama3",
-                        "prompt": f"Transcript:\n{last_transcript}\n\nQuestion: {question}",
-                        "stream": False
-                    },
-                    timeout=10
-                )
-
-                answer = response.json()["response"]
-                print("🧠 Ollama Q&A")
-
-            except Exception:
-                answer = "⚠️ AI services unavailable"
-
+        answer = response.choices[0].message.content
         return {"answer": answer}
 
     except Exception as e:
