@@ -1,0 +1,4 @@
+.nhost
+.secrets
+.env
+backend/.env
